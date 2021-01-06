@@ -711,6 +711,7 @@ class Sync(Base):
             yield {
                 '_id': self.get_doc_id(primary_keys),
                 '_index': index,
+                '_type': '_doc',
                 '_source': row,
             }
 
