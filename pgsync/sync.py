@@ -45,6 +45,11 @@ from .utils import (
     transform,
 )
 
+logging.basicConfig(
+    level=logging.NOTSET,
+    format="{asctime} - {name} - [{levelname}]:{message}",
+    style="{",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +78,9 @@ class Sync(Base):
         self.redis = RedisQueue(self.__name)
         self.tree = Tree(self)
         self._last_truncate_timestamp = datetime.now()
+
+        if self.verbose:
+            logger.setLevel(logging.DEBUG)
         if validate:
             self.validate()
             self.create_setting()
@@ -214,8 +222,8 @@ class Sync(Base):
 
         for i, row in enumerate(_rows):
 
-            logger.debug(f'txid: {row.xid}')
-            logger.debug(f'data: {row.data}')
+            sys.stdout.write(f'txid: {row.xid}')
+            sys.stdout.write(f'data: {row.data}')
             # TODO: optimize this so we are not parsing the same row twice
             try:
                 payload = self.parse_logical_slot(row.data)
@@ -261,6 +269,15 @@ class Sync(Base):
             if payload.get('old'):
                 payload_data = payload.get('old')
         return payload_data
+
+    def _determine_table_match(self, table: str, root_table:str) -> bool:
+        # TODO: FIXME!! second check is a temporary and J A N K Y check for partitioned tables
+        matched = table == root_table or (f'{root_table}_p' in table)
+
+        if not matched:
+            sys.stdout.write(f"TABLES DID NOT MATCH!!!! {table}, {root_table}\n")
+
+        return matched
 
     def _payloads(self, nodes, index, payloads):
         """
@@ -322,7 +339,7 @@ class Sync(Base):
                     )
                     raise
 
-        logger.debug(f'tg_op: {tg_op} table: {schema}.{table}')
+        sys.stdout.write(f'tg_op: {tg_op} table: {schema}.{table}, root:{root_table}')
 
         # we might receive an event triggered for a table
         # that is not in the tree node.
@@ -331,8 +348,10 @@ class Sync(Base):
         # table and force a re-sync.
         if (
             table not in self.tree.nodes and
-            table not in self.tree.through_nodes
+            table not in self.tree.through_nodes and
+            not self._determine_table_match(table, root_table)
         ):
+            sys.stdout.write(f'tg_op: TABLE IS NOT IN {self.tree.nodes} or {self.tree.through_nodes} and does not match root_table:{root_table}\n')
             return
 
         filters = {table: [], root_table: []}
@@ -340,7 +359,7 @@ class Sync(Base):
 
         if tg_op == INSERT:
 
-            if table in self.tree.nodes:
+            if table in self.tree.nodes or self._determine_table_match(table, root_table):
 
                 if table == root_table:
                     for payload in payloads:
@@ -437,7 +456,7 @@ class Sync(Base):
 
         if tg_op == UPDATE:
 
-            if table == root_table:
+            if self._determine_table_match(table, root_table):
                 # Here, we are performing two operations:
                 # 1) Build a filter to sync the updated record(s)
                 # 2) Delete the old record(s) in Elasticsearch if the
@@ -473,6 +492,7 @@ class Sync(Base):
                         docs.append({
                             '_id': self.get_doc_id(old_values),
                             '_index': index,
+                            '_type': '_doc',
                             '_op_type': 'delete',
                         })
 
@@ -517,7 +537,7 @@ class Sync(Base):
         if tg_op == DELETE:
 
             # when deleting a root node, just delete the doc in Elasticsearch
-            if table == root_table:
+            if self._determine_table_match(table, root_table):
 
                 docs = []
                 for payload in payloads:
@@ -530,6 +550,7 @@ class Sync(Base):
                     docs.append({
                         '_id': self.get_doc_id(root_primary_values),
                         '_index': index,
+                        '_type': '_doc',
                         '_op_type': 'delete',
                     })
 
@@ -567,12 +588,13 @@ class Sync(Base):
 
         if tg_op == TRUNCATE:
 
-            if table == root_table:
+            if self._determine_table_match(table, root_table):
                 docs = []
                 for doc_id in self.es._search(index, table, {}):
                     docs.append({
                         '_id': doc_id,
                         '_index': index,
+                        '_type': '_doc',
                         '_op_type': 'delete',
                     })
                 if docs:
@@ -702,11 +724,11 @@ class Sync(Base):
                     row[META][extra['table']][extra['column']] = []
                 row[META][extra['table']][extra['column']].append(0)
 
-            if self.verbose:
-                print(f'{(i+1)})')
-                print(f'Pkeys: {primary_keys}')
-                pprint.pprint(row)
-                print('-' * 10)
+            # if self.verbose:
+            #     print(f'{(i+1)})')
+            #     print(f'Pkeys: {primary_keys}')
+            #     pprint.pprint(row)
+            #     print('-' * 10)
 
             yield {
                 '_id': self.get_doc_id(primary_keys),
@@ -739,6 +761,9 @@ class Sync(Base):
 
     def sync_payloads(self, payloads):
         """Sync payload when an event is emitted."""
+        sys.stdout.write(
+            f'sync_payloads: {payloads}\n'
+        )
         docs = []
         for doc in self._payloads(
             self.nodes,
@@ -746,14 +771,27 @@ class Sync(Base):
             payloads,
         ):
             docs.append(doc)
+
+        if payloads and not docs:
+            sys.stderr.write(
+                f'sync_payloads: payloads passed but docs empty?!?!?!\npayloads:{payloads}\ndocs:{docs}\n'
+            )
+            return
+
         try:
+            sys.stdout.write(
+                f'sync_payloads: writing {docs}\n'
+            )
             self.es.bulk(
                 self.index,
                 itertools.chain(*docs),
             )
         except Exception as e:
+            sys.stderr.write(
+                f'sync_payloads: ERROR!!!! {e}\n'
+            )
             logger.exception(f'Exception: {e}')
-            raise
+            raise e
 
     @property
     def checkpoint(self):
@@ -774,11 +812,14 @@ class Sync(Base):
     @threaded
     def poll_redis(self):
         """Consumer which polls Redis continuously."""
+        sys.stdout.write(
+            f'polling redis: {self.redis.key}\n'
+        )
         while True:
             payloads = self.redis.bulk_pop()
             if payloads:
-                logger.debug(
-                    f'poll_redis: {payloads}'
+                sys.stdout.write(
+                    f'poll_redis: {payloads}\n'
                 )
                 self.on_publish(payloads)
 
@@ -796,19 +837,19 @@ class Sync(Base):
         cursor = conn.cursor()
         channel = self.database
         cursor.execute(f'LISTEN {channel}')
-        logger.debug(f'Listening for notifications on channel "{channel}"')
+        sys.stdout.write(f'Listening for notifications on channel "{channel}"')
 
         i = 0
-        j = 0
 
         while True:
             # NB: consider reducing POLL_TIMEOUT to increase throughout
             if select.select(
                 [conn], [], [], POLL_TIMEOUT
             ) == ([], [], []):
-                if i % 10 == 0:
+                if i % 50 == 0:
+                    num_pending = self.redis.qsize()
                     sys.stdout.write(
-                        f'Polling db {channel}: {j:,} cache items\n'
+                        f'Polling db {channel}: {num_pending:,} cache items\n'
                     )
                     sys.stdout.flush()
                 i += 1
@@ -819,8 +860,7 @@ class Sync(Base):
                 notification = conn.notifies.pop(0)
                 payload = json.loads(notification.payload)
                 self.redis.push(payload)
-                logger.debug(f'on_notify: {payload}')
-                j += 1
+                sys.stdout.write(f'on_notify: {payload}')
             i = 0
 
     def on_publish(self, payloads):
@@ -831,7 +871,7 @@ class Sync(Base):
         It is called when an event is received from Redis.
         Deserialize the payload from Redis and sync to Elasticsearch.
         """
-        logger.debug(f'on_publish len {len(payloads)}')
+        sys.stdout.write(f'on_publish len {len(payloads)}\n')
 
         # Safe inserts are insert operations that can be performed in any order
         # Optimize the safe INSERTS
@@ -854,7 +894,9 @@ class Sync(Base):
             _payloads = []
             for i, payload in enumerate(payloads):
                 _payloads.append(payload)
+                sys.stdout.write(f'on_publish: _payloads - {_payloads}\n')
                 j = i + 1
+                sys.stdout.write(f'on_publish: j:{j}, i:{i}, if:{j < len(payloads)}\n')
                 if j < len(payloads):
                     payload2 = payloads[j]
                     if (
@@ -863,6 +905,8 @@ class Sync(Base):
                     ):
                         self.sync_payloads(_payloads)
                         _payloads = []
+                    else:
+                        sys.stdout.write(f'on_publish: _payloads - {_payloads}\n')
                 elif j == len(payloads):
                     self.sync_payloads(_payloads)
                     _payloads = []
@@ -879,7 +923,7 @@ class Sync(Base):
         """Pull data from db."""
         txmin = self.checkpoint
         txmax = self.txid_current
-        logger.debug(f'pull txmin: {txmin} txmax: {txmax}')
+        sys.stdout.write(f'pull txmin: {txmin} txmax: {txmax}')
         # forward pass sync
         self.sync(txmin=txmin, txmax=txmax)
         # now sync up to txmax to capture everything we might have missed
@@ -895,7 +939,7 @@ class Sync(Base):
                     seconds=REPLICATION_SLOT_CLEANUP_INTERVAL
                 )
             ):
-                logger.debug(f'Truncating replication slot: {self.__name}')
+                sys.stdout.write(f'Truncating replication slot: {self.__name}')
                 self.logical_slot_get_changes(self.__name, upto_nchanges=None)
                 self._last_truncate_timestamp = datetime.now()
             time.sleep(0.1)
@@ -912,6 +956,7 @@ class Sync(Base):
         """
         # start a background worker producer thread to poll the db and populate
         # the Redis cache
+        sys.stdout.write(f'Running receive on {self.index}\n')
         self.poll_db()
 
         # sync up to current transaction_id
@@ -970,6 +1015,19 @@ class Sync(Base):
     default=False,
     help='Show version info',
 )
+# todo: add bool arg about partitioned table
+# todo: search partitioned table children
+# SELECT
+#     nmsp_parent.nspname AS parent_schema,
+#     parent.relname      AS parent,
+#     nmsp_child.nspname  AS child_schema,
+#     child.relname       AS child
+# FROM pg_inherits
+#          JOIN pg_class parent            ON pg_inherits.inhparent = parent.oid
+#          JOIN pg_class child             ON pg_inherits.inhrelid   = child.oid
+#          JOIN pg_namespace nmsp_parent   ON nmsp_parent.oid  = parent.relnamespace
+#          JOIN pg_namespace nmsp_child    ON nmsp_child.oid   = child.relnamespace
+# WHERE parent.relname='transactions';
 def main(
     config,
     daemon,
@@ -1018,6 +1076,7 @@ def main(
                 params=params,
             )
             sync.pull()
+            sys.stdout.write(f'daemon: {daemon}\n')
             if daemon:
                 sync.receive()
 

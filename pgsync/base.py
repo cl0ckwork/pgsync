@@ -101,6 +101,7 @@ class Base(object):
 
         """
         name = f'{schema}.{table}'
+        sys.stdout.write(f"model: self.__metadata: {self.__metadata}")
         if name not in self.models:
             if schema not in self.__metadata:
                 metadata = sa.MetaData(schema=schema)
@@ -108,6 +109,7 @@ class Base(object):
                 self.__metadata[schema] = metadata
             metadata = self.__metadata[schema]
             if name not in metadata.tables:
+                sys.stdout.write(f"model: metadata_tables: {metadata.tables}")
                 raise TableNotFoundError(
                     f'Table "{name}" not found in registry'
                 )

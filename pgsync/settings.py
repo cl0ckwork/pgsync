@@ -48,6 +48,7 @@ ELASTICSEARCH_VERIFY_CERTS = env.bool(
 )
 
 # Postgres:
+PG_URL = env.str('PG_URL', default=None)
 PG_HOST = env.str('PG_HOST', default='localhost')
 PG_USER = env.str('PG_USER')
 PG_PORT = env.int('PG_PORT', default=5432)
@@ -56,6 +57,8 @@ PG_SSLMODE = env.str('PG_SSLMODE', default=None)
 PG_SSLROOTCERT = env.str('PG_SSLROOTCERT', default=None)
 
 # Redis:
+REDIS_URL = env.str('REDIS_URL', default=None)
+REDIS_SCHEME = env.str('REDIS_SCHEME', default='redis')
 REDIS_HOST = env.str('REDIS_HOST', default='localhost')
 REDIS_PORT = env.int('REDIS_PORT', default=6379)
 REDIS_DB = env.int('REDIS_DB', default=0)
